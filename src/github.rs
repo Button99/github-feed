@@ -1,3 +1,4 @@
+use crate::cache;
 use std::process::Command;
 
 /// Run gh directly so credentials stay managed by GitHub CLI.
@@ -23,8 +24,17 @@ fn api(args: &[&str]) -> Result<String, String> {
         .map_err(|error| format!("GitHub CLI returned invalid UTF-8: {error}"))
 }
 
-pub fn received_activity() -> Result<String, String> {
-    let username = api(&["user", "--jq", ".login"])?;
+pub struct Activity {
+    pub text: String,
+    pub source: &'static str,
+    pub saved_at: u64,
+    pub warning: Option<String>,
+}
+
+pub fn received_activity(refresh: bool) -> Result<Activity, String> {
+    // gh scopes its HTTP cache to the request, including authentication.
+    // Resolve identity before using an account's saved activity.
+    let username = api(&["user", "--cache", "24h", "--jq", ".login"])?;
     let username = username.trim();
     if username.is_empty()
         || !username
@@ -34,15 +44,50 @@ pub fn received_activity() -> Result<String, String> {
         return Err("GitHub returned an invalid account login.".into());
     }
 
+    let cached = cache::load(username);
+    if !refresh
+        && let Some(snapshot) = &cached
+        && cache::now().saturating_sub(snapshot.saved_at) < cache::TTL
+    {
+        return Ok(Activity {
+            text: snapshot.activity.clone(),
+            source: "cache",
+            saved_at: snapshot.saved_at,
+            warning: None,
+        });
+    }
     let endpoint = format!("users/{username}/received_events?per_page=100");
     // @tsv escapes control characters in remote fields. Each page is formatted
     // by gh separately; no JSON dependency is needed for this first milestone.
-    api(&[
+    let fetched = api(&[
         &endpoint,
         "--paginate",
         "--jq",
         ".[] | [.created_at, .actor.login, .type, .repo.name] | @tsv",
-    ])
+    ]);
+    match fetched {
+        Ok(text) => {
+            let saved_at = cache::now();
+            let warning = cache::save(username, &text, saved_at)
+                .err()
+                .map(|error| format!("Could not save activity cache: {error}"));
+            Ok(Activity {
+                text,
+                source: "live",
+                saved_at,
+                warning,
+            })
+        }
+        Err(error) => match cached {
+            Some(snapshot) => Ok(Activity {
+                text: snapshot.activity,
+                source: "stale",
+                saved_at: snapshot.saved_at,
+                warning: Some(format!("{error}. Showing saved activity.")),
+            }),
+            None => Err(error),
+        },
+    }
 }
 
 pub fn activity_lines<'a>(activity: &'a str, repo: Option<&str>) -> Vec<&'a str> {
